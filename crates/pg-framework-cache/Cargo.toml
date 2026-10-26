@@ -1,0 +1,13 @@
+[package]
+name = "pg-framework-cache"
+version.workspace = true
+edition.workspace = true
+readme = "README.md"
+
+[dependencies]
+deadpool-postgres.workspace = true
+pg-framework-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tracing.workspace = true

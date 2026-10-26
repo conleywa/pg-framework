@@ -1,0 +1,12 @@
+[package]
+name = "pg-framework-core"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+deadpool-postgres.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio-postgres.workspace = true
