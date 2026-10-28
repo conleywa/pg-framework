@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use pg_framework_core::{
-    DEFAULT_CACHE_CHANNEL, DEFAULT_MAX_KEY_BYTES, DEFAULT_SHARD_COUNT, KeyHasher,
+    DEFAULT_CACHE_CHANNEL, DEFAULT_CACHE_CONTROL_CHANNEL, DEFAULT_MAX_KEY_BYTES,
+    DEFAULT_OPERATION_TIMEOUT, DEFAULT_SHARD_COUNT, DEFAULT_SHUTDOWN_TIMEOUT, KeyHasher,
 };
 
 /// 缓存写入行为。
@@ -68,8 +69,14 @@ impl BufferConfig {
 pub struct CacheConfig {
     /// 缓存逻辑 namespace。
     pub namespace: String,
+    /// 数据库 schema generation。
+    pub schema_generation: String,
+    /// 数据库物理分区数，用于和 `pgfw_schema_meta` 校验。
+    pub physical_partition_count: u16,
     /// PostgreSQL 通知 channel，必须是不超过 63 字节的安全标识符。
     pub notification_channel: String,
+    /// namespace 控制事件 channel。
+    pub control_channel: String,
     /// 进程内 L1 和写缓冲的 stripe 数量。
     ///
     /// 该值不会写入 PostgreSQL；数据库分区始终由稳定 `key_hash` 选择。
@@ -84,6 +91,8 @@ pub struct CacheConfig {
     pub store_raw_keys: bool,
     /// 所有 stripe 的 L1 总容量。
     pub l1_capacity: usize,
+    /// 所有 stripe 的 L1 value 字节总上限。
+    pub l1_max_bytes: usize,
     /// 调用方未提供 TTL 时使用的默认 TTL。
     pub default_ttl: Option<Duration>,
     /// key 和分区使用的稳定哈希策略。
@@ -92,6 +101,12 @@ pub struct CacheConfig {
     pub recovery_rows_per_shard: usize,
     /// 内存写缓冲限制。
     pub buffer: BufferConfig,
+    /// 单次同步数据库操作的总超时。
+    pub operation_timeout: Duration,
+    /// 后台任务优雅关闭的总超时。
+    pub shutdown_timeout: Duration,
+    /// 是否要求 listener 完成订阅和首次恢复后才允许普通读写。
+    pub require_listener_ready: bool,
 }
 
 impl CacheConfig {
@@ -100,17 +115,24 @@ impl CacheConfig {
     pub fn new(namespace: impl Into<String>) -> Self {
         Self {
             namespace: namespace.into(),
+            schema_generation: "v1".to_owned(),
+            physical_partition_count: DEFAULT_SHARD_COUNT,
             notification_channel: DEFAULT_CACHE_CHANNEL.to_owned(),
+            control_channel: DEFAULT_CACHE_CONTROL_CHANNEL.to_owned(),
             shard_count: DEFAULT_SHARD_COUNT,
             write_mode: WriteMode::Immediate,
             max_value_bytes: 1024 * 1024,
             max_key_bytes: DEFAULT_MAX_KEY_BYTES,
             store_raw_keys: false,
             l1_capacity: 100_000,
+            l1_max_bytes: 64 * 1024 * 1024,
             default_ttl: None,
             key_hasher: KeyHasher::default(),
             recovery_rows_per_shard: 1_000,
             buffer: BufferConfig::default(),
+            operation_timeout: DEFAULT_OPERATION_TIMEOUT,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            require_listener_ready: true,
         }
     }
 
@@ -118,6 +140,13 @@ impl CacheConfig {
     #[must_use]
     pub fn with_write_mode(mut self, write_mode: WriteMode) -> Self {
         self.write_mode = write_mode;
+        self
+    }
+
+    /// 设置是否要求 listener 就绪后才能访问缓存。
+    #[must_use]
+    pub fn with_listener_requirement(mut self, required: bool) -> Self {
+        self.require_listener_ready = required;
         self
     }
 }

@@ -18,4 +18,7 @@ pub enum RateLimitError {
     /// 共享配置失败。
     #[error(transparent)]
     Core(#[from] CoreError),
+    /// 操作执行超时。
+    #[error("限频操作超时：{0}")]
+    Timeout(&'static str),
 }

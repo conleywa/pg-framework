@@ -9,7 +9,7 @@
 | 组件 | PostgreSQL 中的角色 | 一致性模型 |
 | --- | --- | --- |
 | [缓存](./crates/pg-framework-cache/README.md) | 分片非日志缓存表 + 合并写缓冲 + key 失效通知 | L1 默认最终一致，可显式选择共享强读 |
-| [分布式锁](./crates/pg-framework-lock/README.md) | 日志锁表 + 全局 fencing token 序列 | 有界租约；下游校验 fencing 后阻止旧 owner |
+| [分布式锁](./crates/pg-framework-lock/README.md) | 日志锁表 + 全局 fencing token 序列 | 有界租约、同 Guard 有界重入；下游校验 fencing |
 | [限频](./crates/pg-framework-ratelimit/README.md) | 分片原子计数和窗口状态 | 单 key 操作强一致 |
 
 三个组件共享 PostgreSQL 连接、数据库时钟、TTL 清理思路和可观测性约定，但不强行共用一套存储抽象。缓存的核心是“读取和失效”，限频的核心是“原子累加和决策”，锁的核心是“租约归属和旧 owner fencing”，三者的数据一致性要求不同。
@@ -48,9 +48,15 @@
 
 缓存 value 只存储在 PostgreSQL 非日志表和进程内 L1，不发送到 NOTIFY payload。key 级 NOTIFY 只发送固定 32 字节 `KeyId` 的十六进制文本，即 64 字节 payload；不发送 namespace 原文、operation、TTL 或批量 key 列表，避免超过 PostgreSQL `NOTIFY` 的 8000 字节上限。
 
+每个 L2 行带单调递增 `version`。L2 读取和重连 warm reload 都携带 version，L1 安装只允许同版本或更高版本覆盖，避免旧快照覆盖新值。version 不进入 key-only NOTIFY；每次实际更新仍在同一事务中发送对应 key 的失效事件。
+
+namespace 清理使用 `pgfw_cache_namespace.clearing/epoch` 和 65 字节控制事件。开始事件会清空 L1/pending，写事务通过 `FOR SHARE` 与清理的 `UPDATE` 建立屏障，避免新写入与批量删除交错。
+
 `UNLOGGED` 表适合可重建的缓存数据，但不写 WAL，也不参与物理复制。数据库异常重启或主备切换后缓存会变冷；这是用可接受的缓存丢失换取更低的 PG 写入成本。
 
 缓存支持 `Immediate` 和 `Buffered` 两种写入模式。`Buffered` 写入成功只代表进入有界内存队列；后台 flusher 按时间、key 数或字节数触发批量提交。需要 L2 已提交语义时必须使用 `Immediate` 或等待显式 `flush()`。
+
+推荐使用异步 `CacheListener::start`。它仅在 schema 校验、LISTEN、namespace 状态检查和首次有界重载全部完成后返回；`require_listener_ready` 默认开启，未就绪时普通读写返回 `Recovering`。
 
 ### 限频
 
@@ -73,6 +79,7 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 3. holder 按 lease TTL 的三分之一续租，并在连接错误时回查 owner token 和 fencing token。
 4. release 必须同时匹配 owner token 与 fencing token，旧 owner 不能删除新 owner 的锁行。
 5. 被保护资源原子拒绝小于或等于已见 fencing token 的写入。
+6. 同一 Guard 通过 `reenter()` 增加本地深度，共享 owner、fencing 和 deadline；最外层 release 才删除数据库行。
 
 租约到期意味着新 owner 可以接管，但旧 owner 可能因网络分区或长时间暂停而不知道。因此锁组件不能只提供 `is_locked()` 或 `is_active()`；关键写入必须携带 fencing token。PostgreSQL 重连后，过期的 Guard 永久进入 `Lost`，不能因为数据库恢复而复活。
 
@@ -84,7 +91,7 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 - 限频计数必须设置 TTL，窗口结束后经过短暂宽限期即可清理。
 - 锁使用有上下界的 lease TTL；本地只保存根据数据库剩余时长换算出的单调时钟安全 deadline。
 - 过期判断发生在读取时。后台清理只负责回收空间，不能让已经过期的数据重新可见。
-- 缓存和限频清理按分片轮询；锁清理只删除已经过期的活跃锁行。所有清理都使用分批删除和 `FOR UPDATE SKIP LOCKED`。
+- 分区表清理按主键集合分批，不能只按 `ctid` 关联，因为 `ctid` 只在单个分区内唯一；锁表清理仍使用有界批处理。
 - 本地 L1 使用根据数据库剩余 TTL 换算出的单调时钟 deadline，不直接使用应用机器墙钟。
 
 ## DML
@@ -116,6 +123,7 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 ### 分布式锁 DML
 
 - `try_acquire`：原子占用空闲或已过期锁行，返回 Guard 中的 fencing token 和单调安全 deadline；owner token 保持内部私有。
+- `reenter`：从当前有效 Guard 派生嵌套 Guard，不产生新数据库行或 fencing token。
 - `acquire`：在调用方 deadline 内使用抖动退避等待，不长期占用数据库连接。
 - `renew`：同时匹配 owner token、fencing token 和未过期条件，延长租约。
 - `release`：同时匹配 owner token 和 fencing token，删除当前 owner 的锁行。
@@ -130,7 +138,7 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 - `Shared` 读每次访问 PostgreSQL，不读取未经验证的 L1，适合跨实例 read-after-write 场景。
 - `Buffered` 写入在刷盘前只对写实例的 pending overlay 可见，其他实例仍可能读到旧 L2/L1；`Shared` 读取遇到 pending key 时先等待 flush。
 - NOTIFY 不是持久消息，不支持断线重放。监听重连或事件流出现缺口时必须清空对应 L1。
-- PG 重连后必须先重新 LISTEN，再从 L2 有界重载；重载期间到达的失效事件必须阻止旧快照重新进入 L1。
+- PG 重连后必须先校验 schema、重新 LISTEN，再从 L2 有界重载；version 和 epoch 防止旧快照重新进入 L1。
 - 需要锁语义时使用独立锁组件，而不是缓存 writer ownership、`set_if_absent` 或空闲 TTL。
 
 限频的单 key 决策是强一致的，但不同 key 之间不提供跨 key 原子事务。业务如果需要一次消费多个 key，应使用专门的事务接口，而不是依次调用普通 `check`。
@@ -141,15 +149,16 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 - 旧 owner 的所有关键写入都必须被下游资源的 fencing 条件拒绝。
 - 只检查本地 Guard 是否 active、只记录日志或只依赖 TTL，都不能阻止恢复运行后的旧 owner 写入。
 - 锁不保证 FIFO 公平性，也不提供跨多个 key 的原子获取。
+- 重入只适用于同一 Guard 派生链；不同进程或不同 Locker 实例不能仅凭相同 key 自动重入。
 
 ## 故障策略
 
 | 场景 | 推荐行为 |
 | --- | --- |
-| 缓存监听连接断开 | 默认允许 L1 继续服务到 TTL；严格 namespace 可配置为 fail-closed，并在恢复时清除和重载 |
+| 缓存监听连接断开 | 默认 `require_listener_ready = true`，退出 Ready 并返回 `Recovering`；恢复后清除并重载 |
 | 缓存 PostgreSQL 不可用 | `LocalFirst` 可返回仍有效的 L1；L2 miss 返回存储错误 |
-| 缓存写缓冲接近上限 | 触发同步刷盘和背压；PG 仍不可用时返回显式错误 |
-| PG 网络抖动恢复 | 缓存重新 LISTEN、清 L1 并有界重载；限频重新校验 schema 后直接继续读 PG |
+| 缓存写缓冲达到上限 | 原子额度预留失败后返回 `BufferFull`；PG 不可用时后台退避重试 |
+| PG 网络抖动恢复 | 缓存重新校验 schema、LISTEN、清 L1 并按 version 有界重载；限频重新校验 schema 后继续读 PG |
 | PG 主备切换 | 接受非日志缓存变冷，重新建立监听并清空 L1；限频依赖日志表恢复 |
 | 限频 PostgreSQL 不可用 | 默认 fail-closed；业务必须显式选择其他策略 |
 | 锁 acquire 响应丢失 | 按预生成 owner token 回查；有效则恢复同一 fencing token，否则重新尝试 |
@@ -165,6 +174,7 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 - 所有需要共享缓存的应用实例必须连接同一个 PostgreSQL 数据库。
 - cache、ratelimit、lock 默认共享同一个进程级 PostgreSQL 连接池，`DEFAULT_POOL_MAX_SIZE = 8`。
 - 池大小按 `ceil(QPS × P99 数据库延迟) + burst margin` 评估，并保证所有实例池上限之和低于 PostgreSQL `max_connections`，预留管理连接和主备切换余量。高延迟查询不能只靠扩大池解决。
+- 默认池包含 wait/create/recycle timeout，连接配置默认包含 connect、statement 和 lock timeout；外部连接池必须提供等价限制。
 - LISTEN 使用 PG 会话，必须使用专用直连或 session pooling；不能使用 PgBouncer transaction pooling。
 - 迁移建表时区分 `UNLOGGED` 缓存表与普通日志表（限频、锁）。
 - 锁表必须与 non-cycling fencing sequence 一起备份和恢复；不能把锁表建成 `UNLOGGED`。
@@ -193,4 +203,6 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 - `sha2`、`hmac`、`getrandom`
 - `thiserror`、`tracing`
 
-默认进程级连接池上限为 `DEFAULT_POOL_MAX_SIZE = 8`，三个组件应共享同一个池。当前自动验证覆盖 key 路由、buffer 合并、配置边界和敏感 Debug 输出；接入真实 PostgreSQL 的集成测试需要在部署环境运行 SQL 迁移后补充执行。
+默认进程级连接池上限为 `DEFAULT_POOL_MAX_SIZE = 8`，三个组件应共享同一个池。自动验证覆盖 key 路由、buffer 合并状态机、L1 条目/字节双上限、版本防回退、配置边界和敏感 Debug 输出。真实 PostgreSQL smoke test 位于 `pg-framework-integration-tests`，通过专用测试库运行。
+
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml) 会执行格式检查、严格 Clippy、单元测试、文档构建，并使用 PostgreSQL service 运行真实数据库 smoke test。

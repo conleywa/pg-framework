@@ -7,8 +7,8 @@ mod locker;
 mod types;
 
 pub use config::{
-    DEFAULT_ACQUIRE_BACKOFF, DEFAULT_LEASE_SAFETY_MARGIN, DEFAULT_MAX_LEASE, DEFAULT_MIN_LEASE,
-    LockConfig,
+    DEFAULT_ACQUIRE_BACKOFF, DEFAULT_LEASE_SAFETY_MARGIN, DEFAULT_MAX_LEASE,
+    DEFAULT_MAX_REENTRANT_DEPTH, DEFAULT_MIN_LEASE, LockConfig,
 };
 pub use error::LockError;
 pub use guard::LeaseGuard;

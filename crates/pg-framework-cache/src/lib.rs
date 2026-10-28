@@ -94,11 +94,20 @@ impl CacheFlusher {
     ///
     /// 后台任务 panic 或最终刷盘失败时返回错误。
     pub async fn shutdown(mut self) -> Result<(), CacheError> {
+        let shutdown_timeout = self.cache.config.shutdown_timeout;
         let _ = self.shutdown.send(true);
-        if let Some(handle) = self.handle.take() {
-            handle.await?;
+        if let Some(mut handle) = self.handle.take() {
+            match tokio::time::timeout(shutdown_timeout, &mut handle).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    handle.abort();
+                    return Err(CacheError::Timeout("background shutdown"));
+                }
+            }
         }
-        self.cache.flush().await
+        tokio::time::timeout(shutdown_timeout, self.cache.flush())
+            .await
+            .map_err(|_| CacheError::Timeout("final flush"))?
     }
 }
 
@@ -122,7 +131,9 @@ mod tests {
     #[tokio::test]
     async fn buffered_update_replaces_pending_value() {
         let pool = build_pool(tokio_postgres::Config::new(), 1).expect("pool");
-        let config = CacheConfig::new("tests").with_write_mode(WriteMode::Buffered);
+        let config = CacheConfig::new("tests")
+            .with_write_mode(WriteMode::Buffered)
+            .with_listener_requirement(false);
         let cache = Arc::new(Cache::new(pool, config).expect("cache"));
 
         cache.set(b"key", vec![1], None).await.expect("first write");

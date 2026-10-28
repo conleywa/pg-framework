@@ -22,6 +22,8 @@ pub struct CacheStats {
     pub pending_bytes: usize,
     /// 当前 L1 条目数。
     pub l1_entries: usize,
+    /// 当前 L1 value 字节数。
+    pub l1_bytes: usize,
 }
 
 /// 管理扫描接口返回的 key。
@@ -29,6 +31,8 @@ pub struct CacheStats {
 pub struct StoredCacheKey {
     /// 用于路由和失效的稳定哈希。
     pub key_id: KeyId,
+    /// 当前 L2 行版本。
+    pub version: i64,
     /// 开启 `store_raw_keys` 时保存的原始 key。
     pub raw_key: Option<Vec<u8>>,
 }

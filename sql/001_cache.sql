@@ -10,6 +10,13 @@ CREATE UNLOGGED TABLE IF NOT EXISTS pgfw_cache_entry (
     CHECK (raw_key IS NULL OR octet_length(raw_key) BETWEEN 1 AND 1024)
 ) PARTITION BY HASH (key_hash);
 
+CREATE UNLOGGED TABLE IF NOT EXISTS pgfw_cache_namespace (
+    namespace   text        NOT NULL PRIMARY KEY,
+    clearing    boolean     NOT NULL DEFAULT false,
+    epoch       bigint      NOT NULL DEFAULT 1 CHECK (epoch > 0),
+    updated_at  timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 DO $$
 BEGIN
     FOR partition_number IN 0..63 LOOP

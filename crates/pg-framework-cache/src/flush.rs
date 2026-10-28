@@ -1,5 +1,5 @@
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pg_framework_core::KeyId;
 use tokio::sync::Notify;
@@ -18,6 +18,9 @@ impl Cache {
     /// 返回第一个存储错误；失败的变更继续保留在缓冲区。
     pub async fn flush(&self) -> Result<(), CacheError> {
         let _gate = self.flush_gate.lock().await;
+        let deadline = Instant::now()
+            .checked_add(self.config.operation_timeout)
+            .ok_or(CacheError::InvalidConfig("operation timeout is too large"))?;
         loop {
             let mut made_progress = false;
             for shard in 0..self.pending.len() {
@@ -25,7 +28,13 @@ impl Cache {
                 if batch.is_empty() {
                     continue;
                 }
-                self.flush_batch(&batch).await?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(CacheError::Timeout("flush"));
+                }
+                tokio::time::timeout(remaining, self.flush_batch(&batch))
+                    .await
+                    .map_err(|_| CacheError::Timeout("flush"))??;
                 self.commit_pending_batch(shard, &batch);
                 made_progress = true;
             }
@@ -47,6 +56,16 @@ impl Cache {
 
     pub(crate) fn flush_interval(&self) -> Duration {
         self.config.buffer.flush_interval
+    }
+
+    pub(crate) fn discard_pending(&self) {
+        for shard in &self.pending {
+            if let Ok(mut state) = shard.lock() {
+                state.clear();
+            }
+        }
+        self.pending_keys.store(0, Ordering::Release);
+        self.pending_bytes.store(0, Ordering::Release);
     }
 
     fn snapshot_pending_shard(&self, shard: usize) -> Vec<(KeyId, PendingEntry)> {
@@ -114,6 +133,7 @@ impl Cache {
 
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
+        self.ensure_namespace_writable(&transaction).await?;
 
         if !upserts.is_empty() {
             let raw_keys = upserts
@@ -187,6 +207,7 @@ impl Cache {
                      SET expires_at =
                             clock_timestamp()
                             + input.ttl_ms * interval '1 millisecond',
+                         version = cache.version + 1,
                          updated_at = clock_timestamp()
                      FROM unnest($2::bytea[], $3::bigint[])
                           AS input(key_hash, ttl_ms)
@@ -203,7 +224,9 @@ impl Cache {
             transaction
                 .execute(
                     "UPDATE pgfw_cache_entry
-                     SET expires_at = NULL, updated_at = clock_timestamp()
+                     SET expires_at = NULL,
+                         version = version + 1,
+                         updated_at = clock_timestamp()
                      WHERE namespace = $1
                        AND key_hash = ANY($2::bytea[])
                        AND (expires_at IS NULL OR expires_at > clock_timestamp())",

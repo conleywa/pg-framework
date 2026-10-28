@@ -11,6 +11,7 @@
 - 租约时间由数据库时钟决定，应用使用剩余时长换算单调时钟 deadline。
 - 每次重新获取锁都获得严格递增的 fencing token。
 - 网络抖动、提交结果未知或续租失败时，不盲目假设仍持有锁。
+- 同一 Guard 派生链支持有界重入，重入不产生新的数据库锁行或 fencing token。
 - 等待锁不长期占用数据库连接，不使用无界轮询或惊群唤醒。
 - 锁 key、owner token 和业务敏感信息不进入日志。
 
@@ -20,7 +21,7 @@
 - 不保证跨多个锁的原子获取。
 - 不把锁替代为业务幂等、唯一约束或 fencing 校验。
 - 不允许依赖 GC、协程调度或进程存活来判断锁是否仍有效。
-- 第一版不提供可重入锁。同一逻辑任务再次获取同一 key 会被视为另一个 owner。
+- 不支持跨进程、跨 Locker 实例或仅凭相同业务 key 推断重入；无法证明同一 owner 时仍按普通竞争处理。
 - 不使用 PostgreSQL session advisory lock 实现跨资源长事务租约。advisory lock 随会话和数据库重启消失，也不能携带 fencing token。
 
 ## 一致性模型
@@ -49,6 +50,17 @@ Fencing   = 共享资源拒绝比已见 token 更旧或相等的写入
 4. A 恢复运行，并在检查本地状态前向共享资源写入。
 
 数据库锁已经属于 B，但 A 仍可能执行写入。只有共享资源拒绝 token 10，才能保证 A 不会覆盖 B。仅有 TTL 或“心跳超时”不能解决该问题。
+
+## 重入语义
+
+- 重入入口是 `LeaseGuard::reenter()`，只从当前仍有效的 Guard 派生。
+- 所有派生 Guard 共享 owner token、fencing token、lease TTL 和单调安全 deadline。
+- `reenter()` 只增加本地重入深度，不访问 PostgreSQL。
+- 任意嵌套 Guard 可以 renew，共享 deadline 会同步更新。
+- 嵌套 release 只减少一层本地深度；最后一个 Guard release 时才执行数据库 DELETE。
+- 最大深度由 `LockConfig::max_reentrant_depth` 限制，默认 32。
+- 不同进程、不同 Locker 实例或重新调用 `try_acquire` 都不自动重入，仍会竞争同一数据库行。
+- 重入 Guard 仍受 lease 到期和 fencing 约束；不能把它当作永久锁。
 
 ## 存储模型
 
@@ -229,10 +241,10 @@ owner token 必须在第一次发出 SQL 前生成并保留，直到完成结果
 ### 主备切换
 
 - 锁表和 sequence 使用 WAL，正常情况下可随 PostgreSQL primary 恢复。
-- 新 primary 上必须重新校验 schema generation、表和 sequence 是否存在；不匹配时 fail-closed。
+- `Locker::connect` 在启动时校验 schema generation、锁表和 sequence；确认 primary 重建后应再次调用 `verify_schema`，不匹配时 fail-closed。
 - 异步复制可能让新 primary 丢失旧 primary 已返回的 fencing token。没有同步复制保证时，不能自动继续签发新 token，否则下游可能观察到 token 倒退。
 - 切换期间数据库不可用时，现有 owner 继续消耗本地 deadline。到期即停止；不能因为旧连接对象还在就延长租约。
-- primary 角色变化、server identity 变化或会话重建都会清理连接级缓存和未归并请求状态，但不会修改已持久化的锁行。
+- 会话重建后不会复用旧会话级状态；已持久化锁行仍只由 owner token、fencing token 和数据库时间决定。
 - advisory lock 不参与该恢复模型，因此不作为默认锁实现。
 
 ## Lease 安全窗口
@@ -288,11 +300,15 @@ safe_deadline  = database_remaining_ttl - max(network_p99, scheduler_pause_budge
 - 如果必须获取多个锁，所有调用方按稳定 key 排序获取，并按相反顺序释放。
 - 多锁获取不是原子的；中途失败必须释放已经获取的 Guard。
 - 不要在持有一个锁时无超时等待另一个可能被反向持有的锁。
-- 连接池中执行锁 DML 的操作应有 SQL timeout，并短于业务总超时。
+- 默认连接池设置 connect、wait、create、recycle 和 statement timeout；`LockConfig::operation_timeout` 进一步限制单次组件操作。
 
-## API 方向
+## Rust API
 
 ```rust
+use pg_framework_lock::{
+    build_default_pool, AcquireOutcome, LeaseTtl, LockConfig, Locker,
+};
+
 pub enum AcquireOutcome {
     Acquired(LeaseGuard),
     Contended,
@@ -303,12 +319,17 @@ pub struct LeaseGuard {
     // lock_id, owner_token, fencing_token, monotonic deadline, state
 }
 
-let outcome = locker.try_acquire(&lock_key, LeaseTtl::from_secs(30)).await?;
+let pool = build_default_pool(pg_config)?;
+let locker = Locker::connect(pool, LockConfig::new("project:prod:resource")).await?;
+let outcome = locker.try_acquire(b"resource-42", LeaseTtl::from_secs(30)?).await?;
 let mut lease = match outcome {
     AcquireOutcome::Acquired(lease) => lease,
     AcquireOutcome::Contended => return Ok(()),
+    _ => unreachable!(),
 };
 
+let mut nested = lease.reenter()?;
+nested.release().await?;
 lease.renew().await?;
 let fencing_token = lease.fencing_token();
 // 共享资源必须原子拒绝小于或等于 fencing_token 的旧写入。
@@ -319,9 +340,10 @@ lease.release().await?;
 
 - `LockKey`、`LockId`、`LeaseTtl`、`FencingToken` 使用 newtype，避免与普通整数和字符串混用。
 - `AcquireOutcome` 只表示已确认的 `Acquired` / `Contended`；“结果无法归并”必须通过结构化错误返回。
-- `RenewOutcome` 区分 `Renewed`、`Lost`、`Uncertain`。
+- `RenewOutcome` 区分 `Renewed` 和 `Lost`；无法确认时返回结构化错误并将 Guard 置为 `Uncertain`。
 - `LeaseGuard` 不可 `Clone`，不能被静默丢弃后仍被当成有效锁。
-- `release(self)` 消费 Guard，防止重复释放。
+- `reenter()` 返回同一 owner 的嵌套 Guard；嵌套 Guard 不生成新 fencing token。
+- `release(&mut self)` 保留 Guard 供幂等重试；成功后状态变为 `Released`。
 - 所有错误使用结构化 enum，并标记 `#[non_exhaustive]`。
 - 锁 key 的 Debug 输出只显示 namespace 和 hash，不显示原始 key 或 owner token。
 
@@ -332,6 +354,8 @@ lease.release().await?;
 | 场景 | 行为 |
 | --- | --- |
 | 锁被其他有效 owner 占用 | 返回 `Contended`，按 deadline 和 jitter 重试 |
+| 同一 Guard 重入 | 增加本地深度，不访问数据库；超过上限返回 `ReentrantLimitExceeded` |
+| 嵌套 Guard release | 只减少本地深度，最外层 release 才执行数据库删除 |
 | acquire 响应丢失 | 按 owner token 回查；有效则恢复 Guard，否则重新尝试 |
 | acquire 响应丢失且无法回查 | 返回 `OutcomeUnknown`，不声称成功或竞争失败 |
 | renew 返回空行 | 立即 `Lost`，停止依赖该租约的写入 |
@@ -369,6 +393,9 @@ lease.release().await?;
 - lease 到期后新 owner 可以获取锁，fencing token 严格大于旧 token。
 - 旧 owner 在租约过期后提交的写入被下游 fencing 条件拒绝。
 - renew 返回空行后 Guard 立即进入 Lost，不再报告 active。
+- 同一 Guard 重入三次后持有同一 fencing token，嵌套释放不会删除数据库锁行。
+- 最外层 Guard release 后，其他实例可以立即重新获取锁且 fencing token 单调增加。
+- 重入深度超过配置上限时拒绝派生。
 - renew 超时并在 safe deadline 前无法回查时进入 Uncertain；超过 deadline 后永久 Lost。
 - acquire 已提交但响应丢失时，通过 owner token 回查到同一个 fencing token 并恢复 Guard。
 - 旧 owner 延迟 release 不能删除新 owner 的锁行。

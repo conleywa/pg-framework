@@ -28,3 +28,17 @@ pub(crate) async fn notify_keys(
         .await?;
     Ok(())
 }
+
+pub(crate) async fn notify_namespace(
+    transaction: &tokio_postgres::Transaction<'_>,
+    channel: &str,
+    namespace_id: KeyId,
+    clearing: bool,
+) -> Result<(), tokio_postgres::Error> {
+    let state = if clearing { '1' } else { '0' };
+    let payload = format!("{state}{}", namespace_id.to_hex());
+    transaction
+        .query_one("SELECT pg_notify($1, $2)", &[&channel, &payload])
+        .await?;
+    Ok(())
+}

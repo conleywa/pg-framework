@@ -143,7 +143,7 @@ RETURNING
 
 ```sql
 WITH expired AS (
-    SELECT ctid
+    SELECT namespace, key_hash, window_start
     FROM pgfw_rate_limit_counter
     WHERE expires_at <= clock_timestamp()
     ORDER BY expires_at
@@ -152,7 +152,10 @@ WITH expired AS (
 )
 DELETE FROM pgfw_rate_limit_counter AS counter
 USING expired
-WHERE counter.ctid = expired.ctid;
+WHERE counter.namespace = expired.namespace
+  AND counter.key_hash = expired.key_hash
+  AND counter.window_start = expired.window_start
+  AND counter.expires_at <= clock_timestamp();
 ```
 
 建议监控：
@@ -199,35 +202,46 @@ WHERE counter.ctid = expired.ctid;
 - fail-open 必须由调用方显式配置，并记录结构化指标。
 - 不要自动在数据库失败后切换到本地计数，这会破坏策略上界且难以观测。
 - 请求超时应短于业务整体超时，避免限频故障耗尽连接池。
+- `RateLimiter::connect` 在启动时校验 `pgfw_schema_meta`、schema generation 和物理分区数。
+- 默认连接池包含 wait/create/recycle timeout；`operation_timeout` 为组件级总超时，外部连接池也必须配置等价限制。
 - 网络抖动或进程重连后不加载本地计数快照。每次决策重新访问 PostgreSQL，因此不存在需要恢复的 cache L1。
-- 连接池重连成功后必须重新校验 schema generation、`SHARD_COUNT` 和目标分区可用性；不匹配时保持 fail-closed。
+- `RateLimiter::connect` 在启动时校验 schema generation、分区数和目标表；长生命周期进程在确认数据库会话或 primary 重建后应再次调用 `verify_schema`，不匹配时保持 fail-closed。
 - `check` 在 PostgreSQL 返回前断线时，提交结果可能未知。默认不自动重试写请求，因为盲目重试可能导致同一业务请求重复消费额度；需要安全重试时，应在后续版本增加显式 idempotency token。
 
-## API 方向
+## Rust API
 
 ```rust
+use std::time::Duration;
+use pg_framework_ratelimit::{
+    build_default_pool, RateLimitConfig, RateLimiter,
+};
+
 pub struct RateDecision {
     pub allowed: bool,
     pub limit: u64,
     pub remaining: u64,
-    pub reset_at: OffsetDateTime,
+    pub reset_after: Duration,
     pub retry_after: Option<Duration>,
 }
 
-let decision = limiter
-    .check(&RateKey::new("tenant-1", "login"), 1)
-    .await?;
+let pool = build_default_pool(pg_config)?;
+let config = RateLimitConfig::new(
+    "project:prod:tenant-1:login",
+    Duration::from_secs(60),
+);
+let limiter = RateLimiter::connect(pool, config).await?;
+let decision = limiter.check(b"user-42", 1, 100).await?;
 ```
 
-配置通过 builder 提供：
+配置通过公开字段或构造函数提供：
 
 - PostgreSQL pool。
 - namespace。
-- schema generation 和固定分区配置。
-- 默认算法和策略。
-- SQL timeout。
+- schema generation 和物理分区数。
+- 稳定哈希策略和 key 上限。
+- 单次数据库操作超时。
 - 清理间隔、批次大小和宽限期。
-- PG 故障策略。
+- fail-closed 由调用方错误处理完成。
 
 ## 并发验收场景
 

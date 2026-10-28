@@ -22,7 +22,7 @@ impl Cache {
                 self.flush().await?;
             }
             return self
-                .read_l2(key_id)
+                .timed("shared read", self.read_l2(key_id))
                 .await
                 .map(|entry| entry.map(|item| item.value));
         }
@@ -33,7 +33,7 @@ impl Cache {
         if let Some(value) = self.read_l1(key_id) {
             return Ok(Some(value));
         }
-        let entry = self.load_l2_into_l1(key_id).await?;
+        let entry = self.timed("read", self.load_l2_into_l1(key_id)).await?;
         Ok(entry.map(|item| item.value))
     }
 
@@ -67,7 +67,7 @@ impl Cache {
         if let Some(result) = self.ttl_from_l1(key_id) {
             return Ok(result);
         }
-        self.ttl_from_l2(key_id).await
+        self.timed("ttl", self.ttl_from_l2(key_id)).await
     }
 
     async fn read_with_pending(
@@ -94,13 +94,19 @@ impl Cache {
                 if let Some(value) = self.read_l1(key) {
                     return Ok(Some(value));
                 }
-                Ok(self.load_l2_into_l1(key).await?.map(|item| item.value))
+                Ok(self
+                    .timed("read expire", self.load_l2_into_l1(key))
+                    .await?
+                    .map(|item| item.value))
             }
             Mutation::Persist { .. } => {
                 if let Some(value) = self.read_l1(key) {
                     return Ok(Some(value));
                 }
-                Ok(self.load_l2_into_l1(key).await?.map(|item| item.value))
+                Ok(self
+                    .timed("read persist", self.load_l2_into_l1(key))
+                    .await?
+                    .map(|item| item.value))
             }
         }
     }
@@ -125,7 +131,7 @@ impl Cache {
         let client = self.pool.get().await?;
         let row = client
             .query_opt(
-                "SELECT value,
+                "SELECT value, version,
                     CASE WHEN expires_at IS NULL THEN NULL
                          ELSE GREATEST(
                             0,
@@ -141,9 +147,11 @@ impl Cache {
             .await?;
         Ok(row.map(|row| {
             let value: Vec<u8> = row.get(0);
-            let ttl_ms: Option<i64> = row.get(1);
+            let version: i64 = row.get(1);
+            let ttl_ms: Option<i64> = row.get(2);
             L2Entry {
                 value: Arc::from(value),
+                version,
                 ttl_ms,
             }
         }))
@@ -215,10 +223,12 @@ impl Cache {
             key,
             L1Entry {
                 value: Arc::clone(&entry.value),
+                version: entry.version,
                 expires_at,
                 inserted_at: Instant::now(),
             },
             self.l1_capacity_per_shard,
+            self.l1_bytes_per_shard,
         );
     }
 }

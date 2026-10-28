@@ -4,7 +4,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use deadpool_postgres::{BuildError, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use deadpool_postgres::{
+    BuildError, Manager, ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime,
+};
 use hmac::{Hmac, Mac, digest::KeyInit};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -15,6 +17,8 @@ pub const DEFAULT_SHARD_COUNT: u16 = 64;
 
 /// key 级缓存失效默认使用的 PostgreSQL 通知 channel。
 pub const DEFAULT_CACHE_CHANNEL: &str = "pgfw_cache_v1";
+/// 缓存 namespace 控制事件默认使用的 PostgreSQL 通知 channel。
+pub const DEFAULT_CACHE_CONTROL_CHANNEL: &str = "pgfw_cache_v1_control";
 
 /// 每个应用进程默认允许使用的 PostgreSQL 最大连接数。
 ///
@@ -23,6 +27,23 @@ pub const DEFAULT_CACHE_CHANNEL: &str = "pgfw_cache_v1";
 /// PostgreSQL 的 `max_connections`，同时预留管理和主备切换连接。对于普通低延迟
 /// 应用进程，默认值 8 是较保守的配置。
 pub const DEFAULT_POOL_MAX_SIZE: usize = 8;
+
+/// 默认连接 PostgreSQL 的超时。
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 默认等待连接池空闲连接的超时。
+pub const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// 默认创建连接池连接的预热超时。
+pub const DEFAULT_POOL_CREATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 默认回收连接池连接的预热超时。
+pub const DEFAULT_POOL_RECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// 默认为每个会话设置的 PostgreSQL statement timeout。
+pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 默认为每个会话设置的 PostgreSQL lock timeout。
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+/// 组件单次操作建议使用的默认总超时。
+pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// 后台任务优雅关闭的默认总超时。
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 各组件默认接受的最大 canonical key 长度。
 pub const DEFAULT_MAX_KEY_BYTES: usize = 512;
@@ -70,6 +91,12 @@ impl KeyId {
         }
         encoded
     }
+}
+
+/// 派生稳定的 cache namespace 控制标识。
+#[must_use]
+pub fn namespace_id(namespace: &str) -> KeyId {
+    KeyId::derive("pgfw_cache_namespace_v1", namespace.as_bytes())
 }
 
 /// 稳定的 key 哈希策略。
@@ -226,12 +253,36 @@ pub fn validate_key_size(key_len: usize, max_key_bytes: usize) -> Result<(), Cor
 ///
 /// 连接池大小非法或构建失败时返回错误。
 pub fn build_pool(
-    postgres_config: tokio_postgres::Config,
+    mut postgres_config: tokio_postgres::Config,
     max_size: usize,
 ) -> Result<Pool, CoreError> {
     if max_size == 0 {
         return Err(CoreError::InvalidPoolSize);
     }
+
+    if postgres_config.get_connect_timeout().is_none() {
+        postgres_config.connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+    }
+    let mut options = postgres_config.get_options().unwrap_or_default().to_owned();
+    if !options.contains("statement_timeout") {
+        if !options.is_empty() {
+            options.push(' ');
+        }
+        options.push_str(&format!(
+            "-c statement_timeout={}",
+            DEFAULT_STATEMENT_TIMEOUT.as_millis()
+        ));
+    }
+    if !options.contains("lock_timeout") {
+        if !options.is_empty() {
+            options.push(' ');
+        }
+        options.push_str(&format!(
+            "-c lock_timeout={}",
+            DEFAULT_LOCK_TIMEOUT.as_millis()
+        ));
+    }
+    postgres_config.options(options);
 
     let manager = Manager::from_config(
         postgres_config,
@@ -242,6 +293,9 @@ pub fn build_pool(
     );
     Pool::builder(manager)
         .max_size(max_size)
+        .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
+        .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
+        .recycle_timeout(Some(DEFAULT_POOL_RECYCLE_TIMEOUT))
         .runtime(Runtime::Tokio1)
         .build()
         .map_err(CoreError::PoolBuild)
@@ -254,6 +308,78 @@ pub fn build_pool(
 /// 无法构建连接池时返回错误。
 pub fn build_default_pool(postgres_config: tokio_postgres::Config) -> Result<Pool, CoreError> {
     build_pool(postgres_config, DEFAULT_POOL_MAX_SIZE)
+}
+
+/// 校验组件 schema generation 和物理分区数。
+///
+/// # 错误
+///
+/// PostgreSQL 查询失败、元数据缺失或配置不匹配时返回错误。
+pub async fn verify_schema(
+    pool: &Pool,
+    component: &str,
+    schema_generation: &str,
+    shard_count: u16,
+) -> Result<(), CoreError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT schema_generation, shard_count
+             FROM pgfw_schema_meta
+             WHERE component = $1",
+            &[&component],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Err(CoreError::SchemaMissing {
+            component: component.to_owned(),
+        });
+    };
+    let actual_generation: String = row.get(0);
+    let actual_shards: i32 = row.get(1);
+    let expected_shards = i32::from(shard_count);
+    let table = match component {
+        "cache" => Some("pgfw_cache_entry"),
+        "ratelimit" => Some("pgfw_rate_limit_counter"),
+        "lock" => Some("pgfw_lock"),
+        _ => None,
+    };
+    let Some(table) = table else {
+        return Err(CoreError::SchemaMismatch {
+            component: component.to_owned(),
+            expected_generation: schema_generation.to_owned(),
+            actual_generation,
+            expected_shards,
+            actual_shards,
+        });
+    };
+    let physical_partitions = client
+        .query_one(
+            "SELECT COUNT(*)::bigint
+             FROM pg_inherits
+             WHERE inhparent = to_regclass($1)",
+            &[&table],
+        )
+        .await?
+        .get::<_, i64>(0);
+    let physical_partitions = i32::try_from(physical_partitions).unwrap_or(i32::MAX);
+    if actual_generation != schema_generation
+        || actual_shards != expected_shards
+        || (shard_count > 0 && physical_partitions != expected_shards)
+    {
+        return Err(CoreError::SchemaMismatch {
+            component: component.to_owned(),
+            expected_generation: schema_generation.to_owned(),
+            actual_generation,
+            expected_shards,
+            actual_shards: if shard_count > 0 {
+                physical_partitions
+            } else {
+                actual_shards
+            },
+        });
+    }
+    Ok(())
 }
 
 /// pg-framework 组件共享错误。
@@ -286,6 +412,34 @@ pub enum CoreError {
     KeyTooLarge {
         /// 配置的最大 key 长度。
         max: usize,
+    },
+    /// 无法从连接池获取连接。
+    #[error("获取 PostgreSQL 连接失败")]
+    Pool(#[from] PoolError),
+    /// schema 元数据查询失败。
+    #[error("PostgreSQL schema 校验失败")]
+    Postgres(#[from] tokio_postgres::Error),
+    /// schema 元数据不存在。
+    #[error("组件 {component} 的 schema 元数据不存在")]
+    SchemaMissing {
+        /// 组件名称。
+        component: String,
+    },
+    /// schema generation 或物理分区数不匹配。
+    #[error(
+        "组件 {component} 的 schema 不匹配：期望 {expected_generation}/{expected_shards}，实际 {actual_generation}/{actual_shards}"
+    )]
+    SchemaMismatch {
+        /// 组件名称。
+        component: String,
+        /// 期望 schema generation。
+        expected_generation: String,
+        /// 实际 schema generation。
+        actual_generation: String,
+        /// 期望分区数。
+        expected_shards: i32,
+        /// 实际分区数。
+        actual_shards: i32,
     },
 }
 
@@ -330,6 +484,11 @@ mod tests {
     #[test]
     fn default_pool_size_is_non_zero() {
         assert_eq!(DEFAULT_POOL_MAX_SIZE, 8);
+        let pool = build_default_pool(tokio_postgres::Config::new()).expect("pool");
+        let timeouts = pool.timeouts();
+        assert_eq!(timeouts.wait, Some(DEFAULT_POOL_WAIT_TIMEOUT));
+        assert_eq!(timeouts.create, Some(DEFAULT_POOL_CREATE_TIMEOUT));
+        assert_eq!(timeouts.recycle, Some(DEFAULT_POOL_RECYCLE_TIMEOUT));
     }
 
     #[test]

@@ -27,4 +27,16 @@ pub enum CacheError {
     /// 共享 key 或连接池配置失败。
     #[error(transparent)]
     Core(#[from] CoreError),
+    /// 同步操作超过配置超时。
+    #[error("缓存操作超时：{0}")]
+    Timeout(&'static str),
+    /// listener 尚未完成首次订阅和恢复。
+    #[error("缓存仍在恢复，当前不可读写")]
+    Recovering,
+    /// namespace 正在执行清理。
+    #[error("缓存 namespace 正在清理")]
+    NamespaceClearing,
+    /// listener 未能在超时前完成首次恢复。
+    #[error("缓存 listener 启动或首次恢复失败")]
+    ListenerStartup,
 }

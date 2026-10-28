@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,62 @@ impl Locker {
         })
     }
 
+    /// 创建锁实例并立即校验锁表和 fencing sequence。
+    ///
+    /// # 错误
+    ///
+    /// 配置非法、schema 缺失或不匹配时返回错误。
+    pub async fn connect(pool: Pool, config: LockConfig) -> Result<Self, LockError> {
+        let locker = Self::new(pool, config)?;
+        locker.verify_schema().await?;
+        Ok(locker)
+    }
+
+    /// 校验锁表、fencing sequence 和 schema generation。
+    ///
+    /// # 错误
+    ///
+    /// schema 缺失或 generation 不匹配时返回错误。
+    pub async fn verify_schema(&self) -> Result<(), LockError> {
+        let sequence_exists = self
+            .timed("schema", async {
+                pg_framework_core::verify_schema(
+                    &self.inner.pool,
+                    "lock",
+                    &self.inner.config.schema_generation,
+                    0,
+                )
+                .await?;
+                let client = self.inner.pool.get().await?;
+                let row = client
+                    .query_one(
+                        "SELECT
+                        to_regclass('pgfw_lock') IS NOT NULL,
+                        to_regclass('pgfw_lock_fencing_seq') IS NOT NULL",
+                        &[],
+                    )
+                    .await?;
+                Ok((row.get::<_, bool>(0), row.get::<_, bool>(1)))
+            })
+            .await?;
+        if !sequence_exists.0 {
+            return Err(LockError::InvalidConfig("lock table does not exist"));
+        }
+        if !sequence_exists.1 {
+            return Err(LockError::InvalidConfig("fencing sequence does not exist"));
+        }
+        Ok(())
+    }
+
+    async fn timed<T, F>(&self, operation: &'static str, future: F) -> Result<T, LockError>
+    where
+        F: Future<Output = Result<T, LockError>>,
+    {
+        tokio::time::timeout(self.inner.config.operation_timeout, future)
+            .await
+            .map_err(|_| LockError::Timeout(operation))?
+    }
+
     /// 不等待地尝试获取租约。
     ///
     /// # 错误
@@ -56,15 +113,21 @@ impl Locker {
             .store_raw_keys
             .then(|| Arc::<[u8]>::from(key));
 
-        match self
-            .execute_acquire(key_id, raw_key, owner_token, ttl_ms)
-            .await
-        {
+        let acquire_result = self
+            .timed(
+                "acquire",
+                self.execute_acquire(key_id, raw_key, owner_token, ttl_ms),
+            )
+            .await;
+        match acquire_result {
             Ok(Some(guard)) => Ok(AcquireOutcome::Acquired(guard)),
             Ok(None) => Ok(AcquireOutcome::Contended),
             Err(error) => {
                 warn!(error = %error, "锁获取结果未知，正在根据 owner token 归并");
-                match self.recover_owner(key_id, owner_token).await {
+                match self
+                    .timed("acquire recovery", self.recover_owner(key_id, owner_token))
+                    .await
+                {
                     Ok(Some((fencing_token, remaining))) => Ok(AcquireOutcome::Acquired(
                         self.guard(key_id, owner_token, fencing_token, ttl.get(), remaining),
                     )),
@@ -98,14 +161,14 @@ impl Locker {
     ) -> Result<LeaseGuard, LockError> {
         let mut backoff = Duration::from_millis(25);
         loop {
+            if Instant::now() >= deadline {
+                return Err(LockError::TimedOut);
+            }
             match self.try_acquire(key, ttl).await? {
                 AcquireOutcome::Acquired(guard) => return Ok(guard),
                 AcquireOutcome::Contended => {}
             }
             let now = Instant::now();
-            if now >= deadline {
-                return Err(LockError::TimedOut);
-            }
             let remaining = deadline.saturating_duration_since(now);
             tokio::time::sleep(jitter(backoff.min(remaining))).await;
             backoff = backoff
@@ -125,10 +188,12 @@ impl Locker {
         }
         let mut total = 0u64;
         loop {
-            let client = self.inner.pool.get().await?;
-            let deleted = client
-                .execute(
-                    "WITH expired AS (
+            let deleted = self
+                .timed("cleanup", async {
+                    let client = self.inner.pool.get().await?;
+                    let deleted = client
+                        .execute(
+                            "WITH expired AS (
                         SELECT ctid
                         FROM pgfw_lock
                         WHERE lease_expires_at <= clock_timestamp()
@@ -139,8 +204,11 @@ impl Locker {
                      DELETE FROM pgfw_lock AS lock
                      USING expired
                      WHERE lock.ctid = expired.ctid",
-                    &[&i64::try_from(batch_size).unwrap_or(i64::MAX)],
-                )
+                            &[&i64::try_from(batch_size).unwrap_or(i64::MAX)],
+                        )
+                        .await?;
+                    Ok(deleted)
+                })
                 .await?;
             total = total.saturating_add(deleted);
             if deleted < u64::try_from(batch_size).unwrap_or(u64::MAX) {
@@ -310,4 +378,24 @@ fn jitter(duration: Duration) -> Duration {
     base.saturating_add(Duration::from_nanos(
         u64::try_from(offset).unwrap_or_default(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn acquire_rejects_an_already_expired_deadline_before_database_io() {
+        let pool = pg_framework_core::build_pool(tokio_postgres::Config::new(), 1).expect("pool");
+        let locker = Locker::new(pool, LockConfig::new("test")).expect("locker");
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("deadline");
+
+        let result = locker
+            .acquire(b"key", LeaseTtl::from_secs(3).expect("ttl"), deadline)
+            .await;
+
+        assert!(matches!(result, Err(LockError::TimedOut)));
+    }
 }

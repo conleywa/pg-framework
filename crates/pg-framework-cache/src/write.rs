@@ -30,8 +30,11 @@ impl Cache {
         let ttl = ttl.or(self.config.default_ttl);
         match self.config.write_mode {
             WriteMode::Immediate => {
-                self.set_immediate(key_id, self.stored_raw_key(key), value, ttl)
-                    .await
+                self.timed(
+                    "set",
+                    self.set_immediate(key_id, self.stored_raw_key(key), value, ttl),
+                )
+                .await
             }
             WriteMode::Buffered => {
                 let ttl_ms = ttl.map(duration_millis).transpose()?;
@@ -89,6 +92,7 @@ impl Cache {
         }
         let raw_key = self.stored_raw_key(key);
         let raw_key_param = raw_key.as_deref();
+        self.ensure_namespace_writable_tokio(transaction).await?;
         transaction
             .execute(
                 "INSERT INTO pgfw_cache_entry (
@@ -146,11 +150,14 @@ impl Cache {
         let raw_key = self.stored_raw_key(key);
         let raw_key_param = raw_key.as_deref();
 
-        let mut client = self.pool.get().await?;
-        let transaction = client.transaction().await?;
-        let row = transaction
-            .query_opt(
-                "INSERT INTO pgfw_cache_entry (
+        let inserted = self
+            .timed("set_if_absent", async {
+                let mut client = self.pool.get().await?;
+                let transaction = client.transaction().await?;
+                self.ensure_namespace_writable(&transaction).await?;
+                let row = transaction
+                    .query_opt(
+                        "INSERT INTO pgfw_cache_entry (
                     namespace, raw_key, key_hash, value, version, expires_at
                  )
                  VALUES (
@@ -168,20 +175,23 @@ impl Cache {
                  WHERE pgfw_cache_entry.expires_at IS NULL
                     OR pgfw_cache_entry.expires_at <= clock_timestamp()
                  RETURNING version",
-                &[
-                    &self.config.namespace,
-                    &raw_key_param,
-                    &key_id.as_bytes().as_slice(),
-                    &value.as_ref(),
-                    &ttl_ms,
-                ],
-            )
+                        &[
+                            &self.config.namespace,
+                            &raw_key_param,
+                            &key_id.as_bytes().as_slice(),
+                            &value.as_ref(),
+                            &ttl_ms,
+                        ],
+                    )
+                    .await?;
+                let inserted = row.is_some();
+                if inserted {
+                    notify_key(&transaction, &self.config.notification_channel, key_id).await?;
+                }
+                transaction.commit().await?;
+                Ok(inserted)
+            })
             .await?;
-        let inserted = row.is_some();
-        if inserted {
-            notify_key(&transaction, &self.config.notification_channel, key_id).await?;
-        }
-        transaction.commit().await?;
         self.invalidate(key_id);
         Ok(inserted)
     }
@@ -212,6 +222,7 @@ impl Cache {
         }
         let raw_key = self.stored_raw_key(key);
         let raw_key_param = raw_key.as_deref();
+        self.ensure_namespace_writable_tokio(transaction).await?;
         let row = transaction
             .query_opt(
                 "INSERT INTO pgfw_cache_entry (
@@ -257,7 +268,7 @@ impl Cache {
     pub async fn delete(&self, key: &[u8]) -> Result<(), CacheError> {
         let key_id = self.key_id(key)?;
         match self.config.write_mode {
-            WriteMode::Immediate => self.delete_immediate(key_id).await,
+            WriteMode::Immediate => self.timed("delete", self.delete_immediate(key_id)).await,
             WriteMode::Buffered => self.enqueue(
                 key_id,
                 self.stored_raw_key(key),
@@ -279,6 +290,7 @@ impl Cache {
         key: &[u8],
     ) -> Result<(), CacheError> {
         let key_id = self.key_id(key)?;
+        self.ensure_namespace_writable_tokio(transaction).await?;
         transaction
             .execute(
                 "DELETE FROM pgfw_cache_entry
@@ -303,7 +315,13 @@ impl Cache {
         let key_id = self.key_id(key)?;
         let ttl_ms = duration_millis(ttl)?;
         match self.config.write_mode {
-            WriteMode::Immediate => self.persist_or_expire_immediate(key_id, Some(ttl_ms)).await,
+            WriteMode::Immediate => {
+                self.timed(
+                    "expire",
+                    self.persist_or_expire_immediate(key_id, Some(ttl_ms)),
+                )
+                .await
+            }
             WriteMode::Buffered => self.enqueue(
                 key_id,
                 self.stored_raw_key(key),
@@ -326,7 +344,10 @@ impl Cache {
     pub async fn persist(&self, key: &[u8]) -> Result<(), CacheError> {
         let key_id = self.key_id(key)?;
         match self.config.write_mode {
-            WriteMode::Immediate => self.persist_or_expire_immediate(key_id, None).await,
+            WriteMode::Immediate => {
+                self.timed("persist", self.persist_or_expire_immediate(key_id, None))
+                    .await
+            }
             WriteMode::Buffered => self.enqueue(
                 key_id,
                 self.stored_raw_key(key),
@@ -382,6 +403,7 @@ impl Cache {
         let raw_key_param = raw_key.as_deref();
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
+        self.ensure_namespace_writable(&transaction).await?;
         transaction
             .execute(
                 "INSERT INTO pgfw_cache_entry (
@@ -417,6 +439,7 @@ impl Cache {
     async fn delete_immediate(&self, key: KeyId) -> Result<(), CacheError> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
+        self.ensure_namespace_writable(&transaction).await?;
         transaction
             .execute(
                 "DELETE FROM pgfw_cache_entry
@@ -437,11 +460,13 @@ impl Cache {
     ) -> Result<(), CacheError> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
+        self.ensure_namespace_writable(&transaction).await?;
         transaction
             .execute(
                 "UPDATE pgfw_cache_entry
                  SET expires_at = CASE WHEN $3::bigint IS NULL THEN NULL
                                        ELSE clock_timestamp() + $3 * interval '1 millisecond' END,
+                     version = version + 1,
                      updated_at = clock_timestamp()
                  WHERE namespace = $1 AND key_hash = $2
                    AND (expires_at IS NULL OR expires_at > clock_timestamp())",
@@ -461,11 +486,13 @@ impl Cache {
         ttl_ms: Option<i64>,
     ) -> Result<(), CacheError> {
         let key_id = self.key_id(key)?;
+        self.ensure_namespace_writable_tokio(transaction).await?;
         transaction
             .execute(
                 "UPDATE pgfw_cache_entry
                  SET expires_at = CASE WHEN $3::bigint IS NULL THEN NULL
                                        ELSE clock_timestamp() + $3 * interval '1 millisecond' END,
+                     version = version + 1,
                      updated_at = clock_timestamp()
                  WHERE namespace = $1 AND key_hash = $2
                    AND (expires_at IS NULL OR expires_at > clock_timestamp())",
@@ -488,36 +515,39 @@ impl Cache {
         mutation: Mutation,
     ) -> Result<(), CacheError> {
         let shard = self.shard_id(key);
-        let entry = PendingEntry { raw_key, mutation };
-        let new_bytes = entry.retained_bytes();
         let mut state = self
             .pending
             .get(usize::from(shard))
             .ok_or(CacheError::InvalidConfig("invalid shard"))?
             .lock()
             .map_err(|_| CacheError::InvalidConfig("pending buffer lock poisoned"))?;
-        let old_bytes = state.get(&key).map_or(0, PendingEntry::retained_bytes);
-        let key_count = self.pending_keys.load(Ordering::Acquire);
-        let byte_count = self.pending_bytes.load(Ordering::Acquire);
-        let projected_bytes = byte_count
-            .saturating_sub(old_bytes)
-            .saturating_add(new_bytes);
-        if !state.contains_key(&key) && key_count >= self.config.buffer.max_pending_keys {
-            return Err(CacheError::BufferFull);
-        }
-        if projected_bytes > self.config.buffer.max_pending_bytes {
-            return Err(CacheError::BufferFull);
-        }
-        if state.insert(key, entry).is_none() {
-            self.pending_keys.fetch_add(1, Ordering::AcqRel);
-        }
-        if new_bytes >= old_bytes {
-            self.pending_bytes
-                .fetch_add(new_bytes - old_bytes, Ordering::AcqRel);
+        let (entry, old_bytes) = if let Some(existing) = state.get(&key) {
+            let entry = PendingEntry {
+                raw_key: raw_key.or_else(|| existing.raw_key.clone()),
+                mutation: existing.mutation.clone().merged_with(mutation),
+            };
+            let old_bytes = existing.retained_bytes();
+            (entry, old_bytes)
         } else {
-            self.pending_bytes
-                .fetch_sub(old_bytes - new_bytes, Ordering::AcqRel);
+            let entry = PendingEntry { raw_key, mutation };
+            (entry, 0)
+        };
+        let new_bytes = entry.retained_bytes();
+        let key_was_reserved = if state.contains_key(&key) {
+            false
+        } else {
+            if !self.reserve_pending_key() {
+                return Err(CacheError::BufferFull);
+            }
+            true
+        };
+        if !self.update_pending_bytes(old_bytes, new_bytes) {
+            if key_was_reserved {
+                self.pending_keys.fetch_sub(1, Ordering::AcqRel);
+            }
+            return Err(CacheError::BufferFull);
         }
+        state.insert(key, entry);
         drop(state);
         self.invalidate(key);
         if self.pending_keys.load(Ordering::Acquire) >= self.config.buffer.max_batch_keys
@@ -526,5 +556,42 @@ impl Cache {
             self.wake_flusher();
         }
         Ok(())
+    }
+
+    fn reserve_pending_key(&self) -> bool {
+        let mut current = self.pending_keys.load(Ordering::Acquire);
+        loop {
+            if current >= self.config.buffer.max_pending_keys {
+                return false;
+            }
+            match self.pending_keys.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn update_pending_bytes(&self, old_bytes: usize, new_bytes: usize) -> bool {
+        let mut current = self.pending_bytes.load(Ordering::Acquire);
+        loop {
+            let projected = current.saturating_sub(old_bytes).saturating_add(new_bytes);
+            if projected > self.config.buffer.max_pending_bytes {
+                return false;
+            }
+            match self.pending_bytes.compare_exchange_weak(
+                current,
+                projected,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }

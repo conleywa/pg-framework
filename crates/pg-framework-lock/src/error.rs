@@ -33,4 +33,13 @@ pub enum LockError {
     /// 释放前租约已丢失。
     #[error("锁租约已丢失")]
     AlreadyLost,
+    /// 操作执行超时。
+    #[error("锁操作超时：{0}")]
+    Timeout(&'static str),
+    /// 重入深度达到配置上限。
+    #[error("锁重入深度超过上限 {max}")]
+    ReentrantLimitExceeded {
+        /// 配置的最大重入深度。
+        max: usize,
+    },
 }

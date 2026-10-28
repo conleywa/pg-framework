@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use pg_framework_core::{DEFAULT_MAX_KEY_BYTES, KeyHasher, validate_key_size};
+use pg_framework_core::{
+    DEFAULT_MAX_KEY_BYTES, DEFAULT_OPERATION_TIMEOUT, KeyHasher, validate_key_size,
+};
 
 use crate::LockError;
 
@@ -12,12 +14,16 @@ pub const DEFAULT_MAX_LEASE: Duration = Duration::from_secs(60 * 60);
 pub const DEFAULT_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(1);
 /// 默认获取重试的最大退避时长。
 pub const DEFAULT_ACQUIRE_BACKOFF: Duration = Duration::from_secs(2);
+/// 默认最大重入深度。
+pub const DEFAULT_MAX_REENTRANT_DEPTH: usize = 32;
 
 /// 分布式锁组件配置。
 #[derive(Clone, Debug)]
 pub struct LockConfig {
     /// 所有锁 key 都包含的逻辑 namespace。
     pub namespace: String,
+    /// 锁表和 fencing sequence 的 schema generation。
+    pub schema_generation: String,
     /// 允许的最小租约 TTL。
     pub min_lease: Duration,
     /// 允许的最大租约 TTL。
@@ -32,6 +38,10 @@ pub struct LockConfig {
     pub max_key_bytes: usize,
     /// 是否在哈希旁额外保存原始锁 key。
     pub store_raw_keys: bool,
+    /// 单次数据库操作总超时。
+    pub operation_timeout: Duration,
+    /// 同一 Guard 派生链允许的最大重入深度。
+    pub max_reentrant_depth: usize,
 }
 
 impl LockConfig {
@@ -40,6 +50,7 @@ impl LockConfig {
     pub fn new(namespace: impl Into<String>) -> Self {
         Self {
             namespace: namespace.into(),
+            schema_generation: "v1".to_owned(),
             min_lease: DEFAULT_MIN_LEASE,
             max_lease: DEFAULT_MAX_LEASE,
             safety_margin: DEFAULT_LEASE_SAFETY_MARGIN,
@@ -47,12 +58,27 @@ impl LockConfig {
             key_hasher: KeyHasher::default(),
             max_key_bytes: DEFAULT_MAX_KEY_BYTES,
             store_raw_keys: false,
+            operation_timeout: DEFAULT_OPERATION_TIMEOUT,
+            max_reentrant_depth: DEFAULT_MAX_REENTRANT_DEPTH,
         }
     }
 
     pub(crate) fn validate(&self) -> Result<(), LockError> {
         if self.namespace.is_empty() {
             return Err(LockError::InvalidConfig("namespace is empty"));
+        }
+        if self.schema_generation.is_empty() {
+            return Err(LockError::InvalidConfig("schema generation is empty"));
+        }
+        if self.operation_timeout.is_zero() {
+            return Err(LockError::InvalidConfig(
+                "operation timeout must be positive",
+            ));
+        }
+        if self.max_reentrant_depth == 0 {
+            return Err(LockError::InvalidConfig(
+                "max reentrant depth must be positive",
+            ));
         }
         if self.min_lease.is_zero() || self.max_lease < self.min_lease {
             return Err(LockError::InvalidConfig("lease bounds are invalid"));
@@ -78,6 +104,19 @@ mod tests {
             config.validate(),
             Err(LockError::Core(
                 pg_framework_core::CoreError::InvalidMaxKeyBytes
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_reentrant_depth() {
+        let mut config = LockConfig::new("locks");
+        config.max_reentrant_depth = 0;
+
+        assert!(matches!(
+            config.validate(),
+            Err(LockError::InvalidConfig(
+                "max reentrant depth must be positive"
             ))
         ));
     }

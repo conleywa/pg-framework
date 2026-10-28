@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,46 @@ impl RateLimiter {
     pub fn new(pool: Pool, config: RateLimitConfig) -> Result<Self, RateLimitError> {
         config.validate()?;
         Ok(Self { pool, config })
+    }
+
+    /// 创建限频器并立即校验数据库 schema generation。
+    ///
+    /// # 错误
+    ///
+    /// 配置非法、schema 缺失或不匹配时返回错误。
+    pub async fn connect(pool: Pool, config: RateLimitConfig) -> Result<Self, RateLimitError> {
+        let limiter = Self::new(pool, config)?;
+        limiter.verify_schema().await?;
+        Ok(limiter)
+    }
+
+    /// 校验运行时配置与数据库 schema 元数据一致。
+    ///
+    /// # 错误
+    ///
+    /// schema 缺失、generation 或分区数不匹配时返回错误。
+    pub async fn verify_schema(&self) -> Result<(), RateLimitError> {
+        self.timed("schema", async {
+            pg_framework_core::verify_schema(
+                &self.pool,
+                "ratelimit",
+                &self.config.schema_generation,
+                self.config.physical_partition_count,
+            )
+            .await
+            .map_err(RateLimitError::from)
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn timed<T, F>(&self, operation: &'static str, future: F) -> Result<T, RateLimitError>
+    where
+        F: Future<Output = Result<T, RateLimitError>>,
+    {
+        tokio::time::timeout(self.config.operation_timeout, future)
+            .await
+            .map_err(|_| RateLimitError::Timeout(operation))?
     }
 
     /// 原子消费 `cost` 额度并返回决策。
@@ -53,10 +94,12 @@ impl RateLimiter {
             i64::try_from(cost).map_err(|_| RateLimitError::InvalidConfig("cost is too large"))?;
         let limit = i64::try_from(limit)
             .map_err(|_| RateLimitError::InvalidConfig("limit is too large"))?;
-        let client = self.pool.get().await?;
-        let row = client
-            .query_one(
-                "WITH current_time AS (
+        let row = self
+            .timed("check", async {
+                let client = self.pool.get().await?;
+                let row = client
+                    .query_one(
+                        "WITH current_time AS (
                     SELECT clock_timestamp() AS now
                  ),
                  bounds AS (
@@ -93,16 +136,19 @@ impl RateLimiter {
                             - clock_timestamp()
                         )) * 1000)
                     )::bigint AS reset_ms",
-                &[
-                    &self.config.namespace,
-                    &raw_key.as_deref(),
-                    &key_id.as_bytes().as_slice(),
-                    &cost,
-                    &limit,
-                    &window_ms,
-                    &grace_ms,
-                ],
-            )
+                        &[
+                            &self.config.namespace,
+                            &raw_key.as_deref(),
+                            &key_id.as_bytes().as_slice(),
+                            &cost,
+                            &limit,
+                            &window_ms,
+                            &grace_ms,
+                        ],
+                    )
+                    .await?;
+                Ok(row)
+            })
             .await?;
         let used: i64 = row.get(0);
         let reset_ms: i64 = row.get(1);
@@ -147,10 +193,12 @@ impl RateLimiter {
         }
         let key_id = self.config.key_hasher.derive(&self.config.namespace, key);
         let window_ms = duration_millis(self.config.window)?;
-        let client = self.pool.get().await?;
-        let row = client
-            .query_opt(
-                "WITH current_time AS (
+        let row = self
+            .timed("get", async {
+                let client = self.pool.get().await?;
+                let row = client
+                    .query_opt(
+                        "WITH current_time AS (
                     SELECT clock_timestamp() AS now
                  ),
                  bounds AS (
@@ -173,12 +221,15 @@ impl RateLimiter {
                  JOIN bounds
                    ON counter.window_start = bounds.window_start
                  WHERE counter.namespace = $1 AND counter.key_hash = $2",
-                &[
-                    &self.config.namespace,
-                    &key_id.as_bytes().as_slice(),
-                    &window_ms,
-                ],
-            )
+                        &[
+                            &self.config.namespace,
+                            &key_id.as_bytes().as_slice(),
+                            &window_ms,
+                        ],
+                    )
+                    .await?;
+                Ok(row)
+            })
             .await?;
         Ok(row.map(|row| {
             let used = u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX);
@@ -201,14 +252,18 @@ impl RateLimiter {
     pub async fn reset(&self, key: &[u8]) -> Result<u64, RateLimitError> {
         validate_key_size(key.len(), self.config.max_key_bytes)?;
         let key_id = self.config.key_hasher.derive(&self.config.namespace, key);
-        let client = self.pool.get().await?;
-        Ok(client
-            .execute(
-                "DELETE FROM pgfw_rate_limit_counter
-                 WHERE namespace = $1 AND key_hash = $2",
-                &[&self.config.namespace, &key_id.as_bytes().as_slice()],
-            )
-            .await?)
+        self.timed("reset", async {
+            let client = self.pool.get().await?;
+            let deleted = client
+                .execute(
+                    "DELETE FROM pgfw_rate_limit_counter
+                     WHERE namespace = $1 AND key_hash = $2",
+                    &[&self.config.namespace, &key_id.as_bytes().as_slice()],
+                )
+                .await?;
+            Ok(deleted)
+        })
+        .await
     }
 
     /// 按有界批次删除过期窗口。
@@ -222,11 +277,13 @@ impl RateLimiter {
         }
         let mut total = 0u64;
         loop {
-            let client = self.pool.get().await?;
-            let deleted = client
-                .execute(
-                    "WITH expired AS (
-                        SELECT ctid
+            let deleted = self
+                .timed("cleanup", async {
+                    let client = self.pool.get().await?;
+                    let deleted = client
+                        .execute(
+                            "WITH expired AS (
+                        SELECT namespace, key_hash, window_start
                         FROM pgfw_rate_limit_counter
                         WHERE expires_at <= clock_timestamp()
                         ORDER BY expires_at
@@ -235,9 +292,15 @@ impl RateLimiter {
                      )
                      DELETE FROM pgfw_rate_limit_counter AS counter
                      USING expired
-                     WHERE counter.ctid = expired.ctid",
-                    &[&i64::try_from(batch_size).unwrap_or(i64::MAX)],
-                )
+                     WHERE counter.namespace = expired.namespace
+                       AND counter.key_hash = expired.key_hash
+                       AND counter.window_start = expired.window_start
+                       AND counter.expires_at <= clock_timestamp()",
+                            &[&i64::try_from(batch_size).unwrap_or(i64::MAX)],
+                        )
+                        .await?;
+                    Ok(deleted)
+                })
                 .await?;
             total = total.saturating_add(deleted);
             if deleted < u64::try_from(batch_size).unwrap_or(u64::MAX) {
