@@ -50,6 +50,13 @@ CREATE INDEX pgfw_rate_limit_counter_expires_idx
 - `used`：当前窗口已经消费的额度。被拒绝的请求允许饱和在 `limit + 1`，避免继续累加。
 - `expires_at`：窗口结束时间加短暂宽限期，用于清理。
 
+### 数据库可读视图
+
+`pgfw_rate_limit_counter_readable` 把 `key_hash` 显示为十六进制文本，并在启用
+`store_raw_keys` 时显示原始限频主体。合法 UTF-8 直接显示，非法 UTF-8 使用安全
+escape 编码。视图用于受控排障和容量分析，不参与 `check()` 决策，也不能替代数据库
+原子更新。
+
 ## Key 设计
 
 对外使用 `RateKey` 表达主体，内部 key 至少组合：

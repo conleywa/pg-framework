@@ -19,6 +19,8 @@ pub const DEFAULT_SHARD_COUNT: u16 = 64;
 pub const DEFAULT_CACHE_CHANNEL: &str = "pgfw_cache_v1";
 /// 缓存 namespace 控制事件默认使用的 PostgreSQL 通知 channel。
 pub const DEFAULT_CACHE_CONTROL_CHANNEL: &str = "pgfw_cache_v1_control";
+/// 服务发现默认使用的 PostgreSQL 通知 channel。
+pub const DEFAULT_DISCOVERY_CHANNEL: &str = "pgfw_discovery_v1";
 
 /// 每个应用进程默认允许使用的 PostgreSQL 最大连接数。
 ///

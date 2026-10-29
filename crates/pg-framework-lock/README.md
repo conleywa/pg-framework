@@ -104,6 +104,13 @@ CREATE INDEX pgfw_lock_expires_idx
 - `raw_key` 默认不保存；需要管理查询时可显式开启，但锁资源 ID 常包含敏感业务信息。
 - 锁表默认不按业务 key 分表。锁行数应受“同时存活的租约数量”限制；如果 key 基数长期很大，可以按 `key_hash` 做稳定 hash 分区，但同一个 key 必须始终路由到一个分区。
 
+### 数据库可读视图
+
+`pgfw_lock_readable` 显示 namespace、可选原始 key、十六进制 key hash、fencing token
+和 lease 时间。视图有意不包含 `owner_token`，避免把私有续租凭证扩大为日常查询对象。
+原始 key 仅在 `store_raw_keys = true` 时可见。该视图用于受控排障，不用于判断锁是否仍有效；
+锁有效性应以数据库时钟和 Guard 状态为准。
+
 ## Key 设计
 
 ```text

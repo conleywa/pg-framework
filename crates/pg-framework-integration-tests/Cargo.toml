@@ -8,6 +8,7 @@ publish = false
 deadpool-postgres.workspace = true
 pg-framework-cache.workspace = true
 pg-framework-core.workspace = true
+pg-framework-discovery.workspace = true
 pg-framework-lock.workspace = true
 pg-framework-ratelimit.workspace = true
 tokio.workspace = true

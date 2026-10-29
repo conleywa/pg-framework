@@ -377,12 +377,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg-framework-discovery"
+version = "0.1.0"
+dependencies = [
+ "deadpool-postgres",
+ "getrandom",
+ "pg-framework-core",
+ "thiserror",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+]
+
+[[package]]
 name = "pg-framework-integration-tests"
 version = "0.1.0"
 dependencies = [
  "deadpool-postgres",
  "pg-framework-cache",
  "pg-framework-core",
+ "pg-framework-discovery",
  "pg-framework-lock",
  "pg-framework-ratelimit",
  "tokio",

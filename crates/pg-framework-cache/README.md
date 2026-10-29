@@ -74,6 +74,15 @@ CREATE INDEX pgfw_cache_entry_expires_idx
 - `SHARD_COUNT` 在同一个 schema generation 内固定。改变分区数必须创建新 generation；缓存可以切换后冷启动，不能静默复用旧映射。
 - 后台清理、统计和容量告警按物理分区或分批巡检，不能依赖全表 `count(*)` 作为热路径指标。
 
+### 数据库可读视图
+
+`pgfw_cache_entry_readable` 把 `key_hash` 显示为十六进制文本，并通过
+`pgfw_display_text` 显示合法 UTF-8 的 `raw_key` 和 value；非法 UTF-8 自动回退为
+PostgreSQL escape 编码。底表继续使用 `bytea`，避免把任意二进制缓存值限制为字符串。
+
+只有启用 `store_raw_keys` 时 `raw_key_text` 才有值。视图用于受控排障和管理查询，
+不带 key 条件时会扫描所有分区，必须设置 `LIMIT` 或使用 keyset 分页。
+
 ### L1：分片 HashMap
 
 每个缓存实例维护独立的：
