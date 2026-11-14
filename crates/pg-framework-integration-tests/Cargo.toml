@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 deadpool-postgres.workspace = true
 pg-framework-cache.workspace = true
+pg-framework-coordination.workspace = true
 pg-framework-core.workspace = true
 pg-framework-discovery.workspace = true
 pg-framework-lock.workspace = true

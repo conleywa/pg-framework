@@ -1,6 +1,6 @@
 # pg-framework
 
-`pg-framework` 是一组以 PostgreSQL 为共享基础设施的 Rust 通用组件，目标是在多实例部署中承担缓存、限频、分布式租约锁和服务注册发现职责，减少额外中间件的部署、监控和运维成本。
+`pg-framework` 是一组以 PostgreSQL 为共享基础设施的 Rust 通用组件，目标是在多实例部署中承担缓存、限频、分布式租约锁、服务注册发现和协调节点职责，减少额外中间件的部署、监控和运维成本。
 
 项目不追求极限吞吐。优先目标是语义清晰、故障可预期、部署简单，并且不要求业务方引入 Redis 客户端、集群或独立的高可用方案。
 
@@ -10,10 +10,11 @@
 | --- | --- | --- |
 | [缓存](./crates/pg-framework-cache/README.md) | 分片非日志缓存表 + 合并写缓冲 + key 失效通知 | L1 默认最终一致，可显式选择共享强读 |
 | [服务发现](./crates/pg-framework-discovery/README.md) | 分片租约注册表 + 后台心跳 | lease 视角下最终一致，只返回未过期实例 |
+| [协调节点](./crates/pg-framework-coordination/README.md) | 层级节点表 + 会话 lease + 顺序节点 + LISTEN/NOTIFY | 节点读写强一致；临时节点随 lease 失效，watch 最终一致 |
 | [分布式锁](./crates/pg-framework-lock/README.md) | 日志锁表 + 全局 fencing token 序列 | 有界租约、同 Guard 有界重入；下游校验 fencing |
 | [限频](./crates/pg-framework-ratelimit/README.md) | 分片原子计数和窗口状态 | 单 key 操作强一致 |
 
-四个组件共享 PostgreSQL 连接、数据库时钟、TTL 清理思路和可观测性约定，但不强行共用一套存储抽象。缓存核心是“读取和失效”，限频核心是“原子累加和决策”，锁核心是“租约归属和旧 owner fencing”，服务发现核心是“租约存活和实例枚举”，各自的一致性要求不同。
+五个组件共享 PostgreSQL 连接、数据库时钟、TTL 清理思路和可观测性约定，但不强行共用一套存储抽象。缓存核心是“读取和失效”，限频核心是“原子累加和决策”，锁核心是“租约归属和旧 owner fencing”，服务发现核心是“租约存活和实例枚举”，协调节点核心是“层级状态、临时成员和变更观察”，各自的一致性要求不同。
 
 ## 总体架构
 
@@ -24,6 +25,7 @@
                   | logged service registry   |
                   | logged rate-limit parts   |
                   | logged lock + fencing seq |
+                  | coordination tree/session |
                   | LISTEN / NOTIFY           |
                   +-------------+-------------+
                               |
@@ -37,6 +39,7 @@
    | PgListener/Recovery |             | PgListener/Recovery |
    | Lease Guard         |             | Lease Guard         |
    | Service Registry    |             | Service Registry    |
+   | Coordination Client |             | Coordination Client |
    +---------------------+             +---------------------+
 ```
 
@@ -72,7 +75,8 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 `namespace` 只负责逻辑隔离，`key_hash` 负责物理路由，不额外存储 `shard_id`。数据库默认只保存哈希；可显式开启 `store_raw_keys` 保存原始 key，默认 key 上限为 512 字节，SQL 硬上限为 1024 字节。原始 key 会扩大敏感数据边界，低熵 key 应使用 `KeyHasher::HmacSha256`。
 
 数据库巡检可以使用 `pgfw_cache_entry_readable`、`pgfw_lock_readable`、
-`pgfw_rate_limit_counter_readable` 和 `pgfw_service_instance_readable`。这些只读视图
+`pgfw_rate_limit_counter_readable`、`pgfw_service_instance_readable`、
+`pgfw_coordination_session_readable` 和 `pgfw_coordination_node_readable`。这些只读视图
 把固定长度哈希显示为十六进制文本，把合法 UTF-8 的 key、value、metadata 显示为文本，
 非法 UTF-8 字节使用 PostgreSQL escape 编码安全回退。底表仍使用紧凑的 `bytea`，
 视图不暴露 owner token。可读视图面向受控排障，查询父表时必须设置主键条件或 `LIMIT`，
@@ -107,14 +111,28 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 
 `discover()` 返回一次性快照；动态感知使用 `ServiceRegistry::watch()`。watch 先 LISTEN 再读取初始快照，注册/注销事务提交时发送只含 `service_hash` 的小 NOTIFY；收到事件后重新查询并用 Tokio watch channel 推送新实例列表。实例崩溃没有注销事件，因此 watch 同时按配置周期刷新以发现 lease 过期。
 
+### 协调节点
+
+协调节点提供类似 ZooKeeper 的层级路径、持久节点和临时节点，但不兼容 ZooKeeper 协议：
+
+1. `NodePath` 只接受规范绝对路径；根节点 `/` 始终存在，并且不能删除。
+2. 持久节点保存在普通日志表中，只有显式删除才消失。
+3. 临时节点绑定一个带后台心跳的 `CoordinationSession`；所有节点读取都按数据库时钟过滤已过期会话。
+4. 持久或临时顺序节点按 namespace 和父路径独立分配十进制后缀。
+5. 节点数据使用从 0 开始的版本号；`set_data` 和 `delete` 可携带期望版本实现乐观并发控制。
+6. `watch` 同时观察目标节点和直接子节点，先 LISTEN 再读取初始快照；变更事务发送 namespace 级小通知，周期刷新兜底临时节点过期。
+
+临时节点不能拥有子节点，避免父节点随会话消失时形成隐式递归删除。会话显式 `shutdown` 会删除 session 行并通过外键级联删除全部临时节点；进程崩溃时停止心跳，数据库 lease 到期后节点立即从查询结果中消失。后台清理只回收过期 session 和节点，不参与“节点是否仍然有效”的判断。
+
 ## TTL
 
-四个组件都使用数据库时钟产生绝对 deadline，避免不同应用实例的墙钟偏差。
+五个组件都使用数据库时钟产生绝对 deadline，避免不同应用实例的墙钟偏差。
 
 - 缓存支持可选 TTL；未设置 TTL 的记录保持到显式删除。组件可以配置 namespace 默认 TTL。
 - 限频计数必须设置 TTL，窗口结束后经过短暂宽限期即可清理。
 - 锁使用有上下界的 lease TTL；本地只保存根据数据库剩余时长换算出的单调时钟安全 deadline。
 - 服务注册使用有上下界的 lease TTL 和更短的心跳间隔；发现查询只返回数据库时钟下未过期实例。
+- 协调会话使用有上下界的 lease TTL 和更短的心跳间隔；临时节点读取按数据库 lease 过滤，本地 deadline 只用于限制新操作。
 - 过期判断发生在读取时。后台清理只负责回收空间，不能让已经过期的数据重新可见。
 - 分区表清理按主键集合分批，不能只按 `ctid` 关联，因为 `ctid` 只在单个分区内唯一；锁表清理仍使用有界批处理。
 - 本地 L1 使用根据数据库剩余 TTL 换算出的单调时钟 deadline，不直接使用应用机器墙钟。
@@ -163,6 +181,17 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 - `shutdown`：停止心跳并删除本实例注册行。
 - `cleanup_expired`：按主键分批清理过期注册。
 
+### 协调节点 DML
+
+- `create` / `create_sequential`：创建持久节点，父节点必须已经存在。
+- `ensure_path`：幂等创建持久路径及缺失祖先。
+- `start_session`：建立随机会话身份和后台 lease 心跳。
+- `create_ephemeral` / `create_ephemeral_sequential`：创建绑定当前会话的临时节点。
+- `get` / `exists` / `children`：只返回数据库 lease 仍然有效的临时节点。
+- `set_data` / `delete`：支持可选节点版本条件；删除前必须不存在子节点。
+- `watch`：推送目标节点和直接子节点的最新快照，并标记刷新失败时的 stale 状态。
+- `cleanup_expired`：分批删除过期会话，临时节点通过外键级联回收。
+
 ## 一致性边界
 
 缓存不是分布式锁：
@@ -191,6 +220,14 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 - 心跳中段可以显示 `Uncertain`；网络恢复后会重新注册，超过 lease 后显示 `Lost`。
 - 调用方仍需维护连接失败重试、熔断和负载均衡。
 
+协调节点提供强一致的 PostgreSQL 行级读写，但 watch 不是持久事件流：
+
+- 节点创建、更新、删除在单行上按版本串行化；跨多个路径没有事务 API。
+- 临时的会话失效不保证立即产生逐节点通知，watch 必须依赖周期刷新发现 lease 过期。
+- LISTEN/NOTIFY 断线或漏事件后通过重新 LISTEN 和完整路径快照收敛，不能重放中间历史。
+- 临时节点成员关系不能替代 fencing。旧 leader 在暂停后恢复时，关键资源写入仍应使用锁组件或资源侧单调 token。
+- namespace 级通知只包含哈希；高频变更 namespace 会让同 namespace 的 watch 更频繁刷新。
+
 ## 故障策略
 
 | 场景 | 推荐行为 |
@@ -211,18 +248,25 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 | 服务注册网络恢复 | 先尝试原 lease 心跳；行不存在时用相同 registration ID 和 owner token 重新注册 |
 | 服务实例 crash | 不再心跳，lease 到期后自动不再被发现 |
 | 服务发现 schema 漂移 | `connect/verify_schema` fail-closed |
+| 协调会话网络中断 | 未超过安全 deadline 时为 `Uncertain`；节点操作仍由数据库 lease 校验 |
+| 协调会话 lease 过期 | 永久 `Lost`，临时节点从读写结果消失，后续心跳不能复活 |
+| 协调服务进程 crash | 心跳停止，lease 到期后临时成员自动失效 |
+| 协调 watch LISTEN 断开 | 标记 stale，退避后重新 LISTEN 并读取完整路径快照 |
+| 协调 NOTIFY 缺失 | 周期刷新兜底；通知不作为完整历史或计数来源 |
 | 事件消费者落后 | 丢弃事件流并清空对应 L1，随后从 L2 有界重载 |
 
 ## 部署约束
 
 - 所有需要共享缓存的应用实例必须连接同一个 PostgreSQL 数据库。
-- cache、ratelimit、lock 默认共享同一个进程级 PostgreSQL 连接池，`DEFAULT_POOL_MAX_SIZE = 8`。
+- cache、ratelimit、lock、discovery 和 coordination 默认共享同一个进程级 PostgreSQL 连接池，`DEFAULT_POOL_MAX_SIZE = 8`。
 - 池大小按 `ceil(QPS × P99 数据库延迟) + burst margin` 评估，并保证所有实例池上限之和低于 PostgreSQL `max_connections`，预留管理连接和主备切换余量。高延迟查询不能只靠扩大池解决。
 - 默认池包含 wait/create/recycle timeout，连接配置默认包含 connect、statement 和 lock timeout；外部连接池必须提供等价限制。
 - LISTEN 使用 PG 会话，必须使用专用直连或 session pooling；不能使用 PgBouncer transaction pooling。
-- 迁移建表时区分 `UNLOGGED` 缓存表与普通日志表（服务发现、限频、锁）。
+- 迁移建表时区分 `UNLOGGED` 缓存表与普通日志表（服务发现、限频、锁、协调会话和节点）。
 - 锁表必须与 non-cycling fencing sequence 一起备份和恢复；不能把锁表建成 `UNLOGGED`。
 - 服务注册使用普通日志表，并由 `service_hash` 稳定分区；service 数量和 endpoint 长度必须受控。
+- 协调节点表使用普通日志表；临时节点通过 session 外键级联回收，所有读取都必须过滤过期 lease。
+- 协调节点的 LISTEN 连接使用 session pooling；namespace 级通知不携带路径、数据或 owner token。
 - cache/ratelimit 的 schema generation 固定物理分区数；`namespace` 只负责隔离，`key_hash` 负责物理路由，不额外存储 `shard_id`。改变分区数必须迁移或切换 generation。
 - 锁的 schema generation 固定锁表和 fencing sequence；普通异步复制不能自动证明已确认的 fencing token 不会倒退。
 - 容量告警必须覆盖每个物理分区及其索引；只监控父表总量会掩盖单分区膨胀。
@@ -237,11 +281,13 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 - 不把缓存当作锁、队列或持久化消息系统。
 - 不把锁组件当作公平队列、跨 key 原子锁或业务幂等机制。
 - 不把服务发现组件当作 DNS、Kubernetes Service 或强一致拓扑数据库。
+- 不兼容 ZooKeeper 协议，也不提供 ensemble、事务日志复制或持久 watch 事件流。
+- 不把临时节点本身当作带 fencing 的分布式锁。
 - 下游不具备 fencing 校验能力时不承诺旧 owner 的关键写入一定被阻止。
 
 ## 当前状态
 
-四个组件已实现 Async Rust API、PostgreSQL 原子 DML、TTL 清理、稳定 key 路由、连接池接入、数据库可读视图和 `tracing` 观测。SQL 迁移统一保存在 [`sql/`](./sql/README.md)。
+五个组件已实现 Async Rust API、PostgreSQL 原子 DML、TTL 清理、连接池接入、数据库可读视图和 `tracing` 观测。SQL 迁移统一保存在 [`sql/`](./sql/README.md)。
 
 依赖只在 workspace 根声明，且只声明 major/minor 兼容版本，不在各 crate 固定 patch 版本：
 
@@ -249,6 +295,6 @@ cache 和 ratelimit 都按稳定 hash 将 key 映射到固定物理分区。不�
 - `sha2`、`hmac`、`getrandom`
 - `thiserror`、`tracing`
 
-默认进程级连接池上限为 `DEFAULT_POOL_MAX_SIZE = 8`，四个组件应共享同一个池。自动验证覆盖 key 路由、buffer 合并状态机、L1 条目/字节双上限、版本防回退、锁重入、服务发现配置和敏感 Debug 输出。真实 PostgreSQL smoke test 位于 `pg-framework-integration-tests`，通过专用测试库运行。
+默认进程级连接池上限为 `DEFAULT_POOL_MAX_SIZE = 8`，五个组件应共享同一个池。自动验证覆盖 key 路由、buffer 合并状态机、L1 条目/字节双上限、版本防回退、锁重入、服务发现配置、协调路径/版本/会话语义和敏感 Debug 输出。真实 PostgreSQL smoke test 位于 `pg-framework-integration-tests`，通过专用测试库运行。
 
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) 会执行格式检查、严格 Clippy、单元测试、文档构建，并使用 PostgreSQL service 运行真实数据库 smoke test。

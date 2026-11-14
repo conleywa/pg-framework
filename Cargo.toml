@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/pg-framework-cache",
+    "crates/pg-framework-coordination",
     "crates/pg-framework-core",
     "crates/pg-framework-discovery",
     "crates/pg-framework-integration-tests",
@@ -16,6 +17,7 @@ edition = "2024"
 [workspace.dependencies]
 pg-framework-core = { path = "crates/pg-framework-core" }
 pg-framework-cache = { path = "crates/pg-framework-cache" }
+pg-framework-coordination = { path = "crates/pg-framework-coordination" }
 pg-framework-discovery = { path = "crates/pg-framework-discovery" }
 pg-framework-lock = { path = "crates/pg-framework-lock" }
 pg-framework-ratelimit = { path = "crates/pg-framework-ratelimit" }

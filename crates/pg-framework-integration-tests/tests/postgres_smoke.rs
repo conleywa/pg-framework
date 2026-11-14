@@ -2,6 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pg_framework_cache::{Cache, CacheConfig, CacheListener, ReadMode, build_default_pool};
+use pg_framework_coordination::{
+    CoordinationClient, CoordinationConfig, CoordinationError, NodePath, NodeVersion,
+};
 use pg_framework_discovery::{RegistryConfig, ServiceRegistry};
 use pg_framework_lock::{AcquireOutcome, LeaseTtl, LockConfig, Locker};
 use pg_framework_ratelimit::{RateLimitConfig, RateLimiter};
@@ -38,6 +41,10 @@ async fn migrate(pool: &deadpool_postgres::Pool) {
         .batch_execute(include_str!("../../../sql/005_readable_views.sql"))
         .await
         .expect("执行可读视图 migration");
+    client
+        .batch_execute(include_str!("../../../sql/006_coordination.sql"))
+        .await
+        .expect("执行 coordination migration");
 }
 
 fn unique_namespace(prefix: &str) -> String {
@@ -331,4 +338,166 @@ async fn all_components_work_against_postgresql() {
     first_instance.shutdown().await.expect("注销第一实例");
     watch.shutdown().await.expect("关闭服务发现 watch");
     discovery.cleanup_expired(100).await.expect("清理服务注册");
+}
+
+#[tokio::test]
+#[ignore = "需要设置 PGFRAMEWORK_TEST_DATABASE_URL 并使用专用测试数据库"]
+async fn coordination_ephemeral_nodes_and_watch_work_against_postgresql() {
+    let pool = build_default_pool(database_config()).expect("连接池");
+    migrate(&pool).await;
+
+    let mut config = CoordinationConfig::new(unique_namespace("coordination"));
+    config.lease_ttl = Duration::from_secs(5);
+    config.heartbeat_interval = Duration::from_secs(1);
+    config.safety_margin = Duration::from_millis(500);
+    config.watch_refresh_interval = Duration::from_secs(1);
+    let client = CoordinationClient::connect(pool.clone(), config.clone())
+        .await
+        .expect("创建协调节点客户端");
+    let orders = NodePath::parse("/services/orders").expect("orders path");
+    let orders_node = client
+        .ensure_path(&orders, b"catalog".to_vec())
+        .await
+        .expect("创建持久路径");
+    assert_eq!(&*orders_node.data, b"catalog");
+    assert!(client.exists(&orders).await.expect("检查节点"));
+
+    let mut watch = client
+        .watch(&orders, database_config(), Some(Duration::from_millis(500)))
+        .await
+        .expect("启动路径 watch");
+
+    let first_session = client
+        .start_session(Some(Duration::from_secs(5)))
+        .await
+        .expect("建立第一会话");
+    let worker_path = NodePath::parse("/services/orders/worker-1").expect("worker path");
+    let worker = first_session
+        .create_ephemeral(&worker_path, b"ready".to_vec())
+        .await
+        .expect("创建临时节点");
+    assert_eq!(worker.version, NodeVersion::new(0));
+    let child_of_ephemeral =
+        NodePath::parse("/services/orders/worker-1/child").expect("child path");
+    assert!(matches!(
+        first_session
+            .create_ephemeral(&child_of_ephemeral, Vec::new())
+            .await,
+        Err(CoordinationError::EphemeralParent)
+    ));
+    assert!(
+        client
+            .children(&orders)
+            .await
+            .expect("读取子节点")
+            .contains(&"worker-1".to_owned())
+    );
+
+    let updated = client
+        .set_data(&worker_path, b"busy".to_vec(), Some(NodeVersion::new(0)))
+        .await
+        .expect("版本化更新");
+    assert_eq!(updated.version, NodeVersion::new(1));
+    assert!(matches!(
+        client
+            .set_data(&worker_path, b"stale".to_vec(), Some(NodeVersion::new(0)))
+            .await,
+        Err(CoordinationError::VersionConflict {
+            expected,
+            actual
+        }) if expected == NodeVersion::new(0) && actual == NodeVersion::new(1)
+    ));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            watch.changed().await.expect("协调 watch 更新");
+            if watch
+                .latest()
+                .children
+                .iter()
+                .any(|child| child == "worker-1")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("等待临时节点进入 watch");
+
+    let sequence_prefix = NodePath::parse("/services/orders/task-").expect("sequence prefix");
+    let sequence = client
+        .create_sequential(&sequence_prefix, b"pending".to_vec())
+        .await
+        .expect("创建顺序节点");
+    assert_eq!(sequence.path.as_str(), "/services/orders/task-0000000001");
+
+    let readable_client = pool.get().await.expect("获取可读视图连接");
+    let readable = readable_client
+        .query_one(
+            "SELECT node_type, data_text, version
+             FROM pgfw_coordination_node_readable
+             WHERE namespace = $1
+               AND path = $2",
+            &[&config.namespace, &worker_path.as_str()],
+        )
+        .await
+        .expect("查询协调可读视图");
+    assert_eq!(readable.get::<_, String>(0), "ephemeral");
+    assert_eq!(readable.get::<_, String>(1), "busy");
+    assert_eq!(readable.get::<_, i64>(2), 1);
+
+    let second_session = client
+        .start_session(Some(Duration::from_secs(2)))
+        .await
+        .expect("建立第二会话");
+    let expiring_path = NodePath::parse("/services/orders/worker-2").expect("expiring path");
+    second_session
+        .create_ephemeral(&expiring_path, b"temporary".to_vec())
+        .await
+        .expect("创建第二临时节点");
+    drop(second_session);
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    assert!(
+        !client
+            .exists(&expiring_path)
+            .await
+            .expect("检查过期临时节点")
+    );
+    client.cleanup_expired(10).await.expect("清理过期会话");
+
+    first_session.shutdown().await.expect("关闭第一会话");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            watch.changed().await.expect("协调 watch 更新");
+            if !watch
+                .latest()
+                .children
+                .iter()
+                .any(|child| child == "worker-1")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("等待临时节点随会话关闭而消失");
+
+    watch.shutdown().await.expect("关闭协调 watch");
+    assert!(matches!(
+        client.delete(&orders, None).await,
+        Err(CoordinationError::NodeNotEmpty)
+    ));
+    client
+        .delete(&sequence.path, None)
+        .await
+        .expect("删除顺序节点");
+    client
+        .delete(&orders, None)
+        .await
+        .expect("删除 orders 节点");
+    let services = NodePath::parse("/services").expect("services path");
+    client
+        .delete(&services, None)
+        .await
+        .expect("删除 services 节点");
 }

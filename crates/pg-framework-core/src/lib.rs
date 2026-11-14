@@ -21,10 +21,12 @@ pub const DEFAULT_CACHE_CHANNEL: &str = "pgfw_cache_v1";
 pub const DEFAULT_CACHE_CONTROL_CHANNEL: &str = "pgfw_cache_v1_control";
 /// 服务发现默认使用的 PostgreSQL 通知 channel。
 pub const DEFAULT_DISCOVERY_CHANNEL: &str = "pgfw_discovery_v1";
+/// 协调节点默认使用的 PostgreSQL 通知 channel。
+pub const DEFAULT_COORDINATION_CHANNEL: &str = "pgfw_coordination_v1";
 
 /// 每个应用进程默认允许使用的 PostgreSQL 最大连接数。
 ///
-/// 缓存、限频和锁组件应共享同一个连接池。建议按
+/// 缓存、限频、锁、服务发现和协调节点组件应共享同一个连接池。建议按
 /// `ceil(QPS × P99 延迟) + 突发余量` 估算，并确保所有实例连接上限之和小于
 /// PostgreSQL 的 `max_connections`，同时预留管理和主备切换连接。对于普通低延迟
 /// 应用进程，默认值 8 是较保守的配置。
@@ -344,6 +346,7 @@ pub async fn verify_schema(
         "cache" => Some("pgfw_cache_entry"),
         "ratelimit" => Some("pgfw_rate_limit_counter"),
         "lock" => Some("pgfw_lock"),
+        "coordination" => Some("pgfw_coordination_node"),
         _ => None,
     };
     let Some(table) = table else {
